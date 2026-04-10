@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="no">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Snake</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #1a1a2e;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+    }
+
+    /* Vertical flex column: HUD → canvas → button */
+    #wrapper {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+    }
+
+    /* Monospace HUD bar above the canvas */
+    #hud {
+      font-family: 'Courier New', Courier, monospace;
+      font-size: 18px;
+      color: #2ecc40;
+      letter-spacing: 2px;
+      text-shadow: 0 0 8px rgba(46, 204, 64, 0.6);
+      user-select: none;
+      white-space: nowrap;
+    }
+
+    /*
+     * The canvas wrapper is always 600×400 px (native grid resolution).
+     * JavaScript applies transform:scale() here so the canvas pixels stay
+     * 1:1 with the game's CELL size — no coordinate remapping needed.
+     * transform-origin: top center keeps the wrapper anchored under the HUD.
+     */
+    #canvasWrap {
+      width: 600px;
+      height: 400px;
+      transform-origin: top center;
+    }
+
+    canvas {
+      display: block;
+      border: 3px solid #2ecc40;
+      box-shadow: 0 0 30px rgba(46, 204, 64, 0.4);
+      /* Crisp pixel rendering for the grid lines */
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+    }
+
+    /* Restart button sits below the canvas at all times */
+    #restartBtn {
+      font-family: 'Courier New', Courier, monospace;
+      font-size: 14px;
+      color: #1a1a2e;
+      background: #2ecc40;
+      border: none;
+      padding: 8px 28px;
+      cursor: pointer;
+      letter-spacing: 2px;
+      box-shadow: 0 0 14px rgba(46, 204, 64, 0.5);
+      text-transform: uppercase;
+    }
+    #restartBtn:hover { background: #27ae60; }
+  </style>
+</head>
+<body>
+
+<div id="wrapper">
+  <div id="hud">SCORE: 0 &nbsp;&nbsp; BEST: 0 &nbsp;&nbsp; LEVEL: 1</div>
+  <div id="canvasWrap">
+    <!--
+      Canvas internal resolution: COLS×CELL × ROWS×CELL = 600×400 px.
+      The CSS wrapper is CSS-scaled by JS — internal coordinates are never changed.
+    -->
+    <canvas id="gameCanvas" width="600" height="400"></canvas>
+  </div>
+  <button id="restartBtn">RESTART</button>
+</div>
+
+<script>
+  // ── Canvas / context ─────────────────────────────────────────────────────────
+  const canvas = document.getElementById('gameCanvas');
+  const ctx    = canvas.getContext('2d');
+
+  // ── Grid / canvas constants ──────────────────────────────────────────────────
+  // Grid calculation:  canvas width  = COLS × CELL = 30 × 20 = 600 px
+  //                    canvas height = ROWS × CELL = 20 × 20 = 400 px
+  // Every game coordinate (x, y) is a grid cell index, not a pixel position.
+  // Pixel position = gridX * CELL,  gridY * CELL.
+  const COLS       = 30;
+  const ROWS       = 20;
+  const CELL       = 20;   // pixels per grid cell
+
+  // Speed settings — step interval in milliseconds
+  const BASE_SPEED = 150;  // ms between snake steps at tier 0
+  const MIN_SPEED  = 75;   // floor (fastest tier)
+  const SPEED_STEP = 10;   // ms removed per tier
+  const TIER_SIZE  = 5;    // food eaten per tier
+
+  // ── Game states ──────────────────────────────────────────────────────────────
+  const STATE = { START: 0, PLAYING: 1, GAMEOVER: 2 };
+
+  // ── State object ─────────────────────────────────────────────────────────────
+  // snake  — array of {x,y} grid coords, HEAD at index 0.
+  // dir    — current committed direction (applied on each step).
+  // nextDir — queued direction from keyboard; committed at start of step()
+  //           so two rapid presses in the same frame cannot cause a 180° flip.
+  // accumulator — delta-time accumulator in ms; drives fixed-interval steps.
+  const state = {
+    snake:       [],
+    dir:         { x: 1, y: 0 },
+    nextDir:     { x: 1, y: 0 },
+    food:        { x: 0, y: 0 },
+    score:       0,
+    highScore:   parseInt(localStorage.getItem('snakeHighScore'), 10) || 0,
+    foodEaten:   0,
+    gameState:   STATE.START,
+    paused:      false,
+    accumulator: 0,
+    lastTime:    0,
+  };
+
+  // ── Responsive scaling ───────────────────────────────────────────────────────
+  // Scale the #canvasWrap CSS container to fit the viewport.
+  // The canvas internal resolution (600×400) is never changed, so all game
+  // coordinates remain fixed and no pixel distortion occurs.
+  function scaleCanvas() {
+    const availW = window.innerWidth  - 20;   // 10 px side margin each side
+    const availH = window.innerHeight - 130;  // room for HUD + button + gaps
+    const scale  = Math.min(availW / 600, availH / 400, 1); // cap at 1× (no upscale)
+    document.getElementById('canvasWrap').style.transform = `scale(${scale})`;
+  }
+  window.addEventListener('load',   scaleCanvas);
+  window.addEventListener('resize', scaleCanvas);
+
+  // ── Speed formula ────────────────────────────────────────────────────────────
+  // tier = how many complete groups of TIER_SIZE food have been eaten.
+  // stepMs decreases by SPEED_STEP each tier, floored at MIN_SPEED.
+  //
+  // foodEaten |  tier  |  stepMs
+  //   0–4     |   0    |  150 ms
+  //   5–9     |   1    |  140 ms
+  //  10–14    |   2    |  130 ms
+  //    …      |   …    |    …
+  //  40+      |   8    |   75 ms  (floor)
+  function currentStepMs() {
+    const tier = Math.floor(state.foodEaten / TIER_SIZE);
+    return Math.max(MIN_SPEED, BASE_SPEED - tier * SPEED_STEP);
+  }
+
+  // ── HUD update ───────────────────────────────────────────────────────────────
+  // Only called when score or foodEaten changes to minimise DOM writes.
+  function updateHUD() {
+    const level = Math.floor(state.foodEaten / TIER_SIZE) + 1;
+    document.getElementById('hud').textContent =
+      `SCORE: ${state.score}   BEST: ${state.highScore}   LEVEL: ${level}`;
+  }
+
+  // ── Food spawn ───────────────────────────────────────────────────────────────
+  // Build an O(1)-lookup Set of all occupied cells, then collect every free
+  // grid cell into an array and pick one at random.
+  function spawnFood() {
+    const occupied = new Set(state.snake.map(s => `${s.x},${s.y}`));
+    const free = [];
+    for (let y = 0; y < ROWS; y++) {
+      for (let x = 0; x < COLS; x++) {
+        if (!occupied.has(`${x},${y}`)) free.push({ x, y });
+      }
+    }
+    // Edge case: player filled the entire board — no spawn needed.
+    if (free.length === 0) return;
+    state.food = free[Math.floor(Math.random() * free.length)];
+  }
+
+  // ── Reset game ───────────────────────────────────────────────────────────────
+  function resetGame() {
+    // Place a 3-cell snake in the centre of the grid, heading right.
+    const midX = Math.floor(COLS / 2);
+    const midY = Math.floor(ROWS / 2);
+    state.snake       = [
+      { x: midX,     y: midY },
+      { x: midX - 1, y: midY },
+      { x: midX - 2, y: midY },
+    ];
+    state.dir         = { x: 1, y: 0 };
+    state.nextDir     = { x: 1, y: 0 };
+    state.score       = 0;
+    state.foodEaten   = 0;
+    state.gameState   = STATE.PLAYING;
+    state.paused      = false;
+    state.accumulator = 0; // reset so no burst of steps on first frame
+    spawnFood();
+    updateHUD();
+  }
+
+  // ── Trigger game over ────────────────────────────────────────────────────────
+  function triggerGameOver() {
+    state.gameState = STATE.GAMEOVER;
+    // High score was already updated incrementally inside step(); nothing extra needed.
+  }
+
+  // ── Snake step (queue-like movement) ─────────────────────────────────────────
+  // Movement logic:
+  //   1. Commit the queued direction (prevents 180° flip from two rapid presses).
+  //   2. Compute the new head cell.
+  //   3. Check wall collision.
+  //   4. Check self-collision.
+  //      - When NOT eating: exclude the tail cell because it vacates this step.
+  //      - When eating:     include the full snake (tail stays, so it's solid).
+  //   5. Prepend (unshift) the new head — this is the "enqueue" operation.
+  //   6a. Eating: grow the snake (do NOT pop the tail), update score & HS.
+  //   6b. Normal: remove the tail via pop() — this is the "dequeue" operation.
+  function step() {
+    // 1. Commit queued direction
+    state.dir = { ...state.nextDir };
+
+    // 2. New head position
+    const head    = state.snake[0];
+    const newHead = { x: head.x + state.dir.x, y: head.y + state.dir.y };
+
+    // 3. Wall collision
+    if (newHead.x < 0 || newHead.x >= COLS ||
+        newHead.y < 0 || newHead.y >= ROWS) {
+      triggerGameOver();
+      return;
+    }
+
+    // 4. Self-collision
+    const eating      = (newHead.x === state.food.x && newHead.y === state.food.y);
+    const bodyToCheck = eating ? state.snake : state.snake.slice(0, -1);
+    for (const seg of bodyToCheck) {
+      if (seg.x === newHead.x && seg.y === newHead.y) {
+        triggerGameOver();
+        return;
+      }
+    }
+
+    // 5. Enqueue new head
+    state.snake.unshift(newHead);
+
+    // 6. Eat or move
+    if (eating) {
+      state.foodEaten++;
+      state.score++;
+      if (state.score > state.highScore) {
+        state.highScore = state.score;
+        localStorage.setItem('snakeHighScore', state.highScore);
+      }
+      spawnFood();
+      updateHUD();
+    } else {
+      // Dequeue tail: the snake slides forward one cell
+      state.snake.pop();
+    }
+  }
+
+  // ── Input ────────────────────────────────────────────────────────────────────
+  document.addEventListener('keydown', e => {
+    // Prevent arrow keys from scrolling the page
+    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) {
+      e.preventDefault();
+    }
+
+    // Any key on start / game-over screen starts a new game
+    if (state.gameState === STATE.START || state.gameState === STATE.GAMEOVER) {
+      resetGame();
+      return;
+    }
+
+    // Pause toggle (P key)
+    if (e.key === 'p' || e.key === 'P') {
+      state.paused = !state.paused;
+      return;
+    }
+
+    if (state.paused) return;
+
+    // ── 180° reversal guard ──────────────────────────────────────────────────
+    // nextDir is queued and only committed at the top of step(), so two arrow
+    // presses arriving in the same frame can still only produce one direction
+    // change — and that change is validated against state.dir (the direction
+    // that was active at the START of the current step), not against nextDir.
+    if (e.key === 'ArrowUp'    && state.dir.y !== 1)  state.nextDir = { x:  0, y: -1 };
+    if (e.key === 'ArrowDown'  && state.dir.y !== -1) state.nextDir = { x:  0, y:  1 };
+    if (e.key === 'ArrowLeft'  && state.dir.x !== 1)  state.nextDir = { x: -1, y:  0 };
+    if (e.key === 'ArrowRight' && state.dir.x !== -1) state.nextDir = { x:  1, y:  0 };
+  });
+
+  document.getElementById('restartBtn').addEventListener('click', resetGame);
+
+  // ── Rounded rect helper (ported from Flappy Bird index.html) ────────────────
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.quadraticCurveTo(x + w, y,     x + w, y + r);
+    ctx.lineTo(x + w, y + h - r);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    ctx.lineTo(x + r, y + h);
+    ctx.quadraticCurveTo(x, y + h,     x, y + h - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y,         x + r, y);
+    ctx.closePath();
+  }
+
+  // ── Draw: grid lines ─────────────────────────────────────────────────────────
+  // Barely-visible structure lines to reinforce the cell grid.
+  function drawGrid() {
+    ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+    ctx.lineWidth   = 0.5;
+    for (let x = 0; x <= COLS; x++) {
+      ctx.beginPath();
+      ctx.moveTo(x * CELL, 0);
+      ctx.lineTo(x * CELL, ROWS * CELL);
+      ctx.stroke();
+    }
+    for (let y = 0; y <= ROWS; y++) {
+      ctx.beginPath();
+      ctx.moveTo(0,          y * CELL);
+      ctx.lineTo(COLS * CELL, y * CELL);
+      ctx.stroke();
+    }
+  }
+
+  // ── Draw: food ───────────────────────────────────────────────────────────────
+  function drawFood() {
+    const cx = state.food.x * CELL + CELL / 2;
+    const cy = state.food.y * CELL + CELL / 2;
+    const r  = CELL / 2 - 3; // fits inside the cell with a 3px margin
+
+    // Red circle with glow
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fillStyle   = '#e74c3c';
+    ctx.shadowColor = 'rgba(231, 76, 60, 0.8)';
+    ctx.shadowBlur  = 10;
+    ctx.fill();
+    ctx.shadowBlur  = 0;
+
+    // Small white highlight dot
+    ctx.beginPath();
+    ctx.arc(cx - r * 0.3, cy - r * 0.3, r * 0.25, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.fill();
+  }
+
+  // ── Draw: snake ──────────────────────────────────────────────────────────────
+  // Each segment is inset by 1px so adjacent cells have a visible gap.
+  // The head is brighter with a glow; the body fades toward the tail.
+  function drawSnake() {
+    const inset = 1;
+    state.snake.forEach((seg, i) => {
+      const px = seg.x * CELL;
+      const py = seg.y * CELL;
+
+      if (i === 0) {
+        // Head: bright green with glow
+        ctx.fillStyle   = '#2ecc40';
+        ctx.shadowColor = 'rgba(46, 204, 64, 0.7)';
+        ctx.shadowBlur  = 8;
+      } else {
+        // Body: fades from bright to dim toward the tail
+        const alpha = Math.max(0.35, 1 - (i / state.snake.length) * 0.55);
+        ctx.fillStyle  = `rgba(39, 174, 96, ${alpha})`;
+        ctx.shadowBlur = 0;
+      }
+
+      ctx.fillRect(px + inset, py + inset, CELL - inset * 2, CELL - inset * 2);
+    });
+    ctx.shadowBlur = 0; // always reset after drawing
+  }
+
+  // ── Draw: start screen ───────────────────────────────────────────────────────
+  function drawStartScreen() {
+    // Dark canvas background
+    ctx.fillStyle = '#0d0d1a';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    drawGrid();
+
+    // Panel
+    const pw = 380, ph = 220;
+    const px = (canvas.width  - pw) / 2;
+    const py = (canvas.height - ph) / 2;
+
+    ctx.fillStyle = 'rgba(15, 15, 35, 0.94)';
+    roundRect(px, py, pw, ph, 18);
+    ctx.fill();
+    ctx.strokeStyle = '#2ecc40';
+    ctx.lineWidth   = 2;
+    roundRect(px, py, pw, ph, 18);
+    ctx.stroke();
+
+    ctx.textAlign = 'center';
+
+    // Title
+    ctx.font        = 'bold 58px "Courier New", monospace';
+    ctx.fillStyle   = '#2ecc40';
+    ctx.shadowColor = 'rgba(46, 204, 64, 0.6)';
+    ctx.shadowBlur  = 12;
+    ctx.fillText('SNAKE', canvas.width / 2, py + 76);
+    ctx.shadowBlur  = 0;
+
+    // Instructions
+    ctx.font      = '16px "Courier New", monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.fillText('Piltaster for å styre  |  P = pause', canvas.width / 2, py + 118);
+    ctx.fillText('Trykk en tast for å starte', canvas.width / 2, py + 146);
+
+    // High score (if any)
+    if (state.highScore > 0) {
+      ctx.font      = 'bold 18px "Courier New", monospace';
+      ctx.fillStyle = '#2ecc40';
+      ctx.fillText(`REKORD: ${state.highScore}`, canvas.width / 2, py + 186);
+    }
+  }
+
+  // ── Draw: pause overlay ──────────────────────────────────────────────────────
+  function drawPauseOverlay() {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.52)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    ctx.textAlign   = 'center';
+    ctx.font        = 'bold 48px "Courier New", monospace';
+    ctx.fillStyle   = '#2ecc40';
+    ctx.shadowColor = 'rgba(46, 204, 64, 0.7)';
+    ctx.shadowBlur  = 14;
+    ctx.fillText('PAUSE', canvas.width / 2, canvas.height / 2 - 10);
+    ctx.shadowBlur  = 0;
+
+    ctx.font      = '16px "Courier New", monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.65)';
+    ctx.fillText('Trykk P for å fortsette', canvas.width / 2, canvas.height / 2 + 30);
+  }
+
+  // ── Draw: game over screen ───────────────────────────────────────────────────
+  function drawGameOverScreen() {
+    // Full-canvas dim
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.52)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Panel
+    const pw = 380, ph = 260;
+    const px = (canvas.width  - pw) / 2;
+    const py = (canvas.height - ph) / 2;
+
+    ctx.fillStyle = 'rgba(15, 15, 35, 0.94)';
+    roundRect(px, py, pw, ph, 22);
+    ctx.fill();
+    ctx.strokeStyle = '#e74c3c';
+    ctx.lineWidth   = 3;
+    roundRect(px, py, pw, ph, 22);
+    ctx.stroke();
+
+    ctx.textAlign = 'center';
+
+    // "GAME OVER" title
+    ctx.font        = 'bold 46px "Courier New", monospace';
+    ctx.fillStyle   = '#e74c3c';
+    ctx.shadowColor = 'rgba(231, 76, 60, 0.6)';
+    ctx.shadowBlur  = 10;
+    ctx.fillText('GAME OVER', canvas.width / 2, py + 62);
+    ctx.shadowBlur  = 0;
+
+    // Divider
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+    ctx.lineWidth   = 1;
+    ctx.beginPath();
+    ctx.moveTo(px + 30, py + 78);
+    ctx.lineTo(px + pw - 30, py + 78);
+    ctx.stroke();
+
+    // Score
+    ctx.font      = 'bold 28px "Courier New", monospace';
+    ctx.fillStyle = 'white';
+    ctx.fillText(`POENG: ${state.score}`, canvas.width / 2, py + 118);
+
+    // High score
+    ctx.font      = 'bold 22px "Courier New", monospace';
+    ctx.fillStyle = '#2ecc40';
+    ctx.fillText(`REKORD: ${state.highScore}`, canvas.width / 2, py + 154);
+
+    // New-record banner
+    if (state.score > 0 && state.score === state.highScore) {
+      ctx.font        = 'bold 17px "Courier New", monospace';
+      ctx.fillStyle   = '#2ecc40';
+      ctx.shadowColor = 'rgba(46, 204, 64, 0.7)';
+      ctx.shadowBlur  = 8;
+      ctx.fillText('★ Ny rekord! ★', canvas.width / 2, py + 186);
+      ctx.shadowBlur  = 0;
+    }
+
+    // Restart hint
+    ctx.font      = '15px "Courier New", monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.fillText('Trykk en tast eller klikk RESTART', canvas.width / 2, py + 232);
+  }
+
+  // ── Main game loop ───────────────────────────────────────────────────────────
+  // Uses a delta-time accumulator so the snake's step rate is driven by real
+  // elapsed milliseconds rather than frame count. This decouples game speed
+  // from monitor refresh rate and keeps movement smooth even under frame drops.
+  //
+  //  delta        — ms since the previous rAF callback
+  //  accumulator  — accumulated ms not yet consumed by a game step
+  //  currentStepMs() — how many ms one snake step should take (tier-dependent)
+  //
+  // The while loop fires as many steps as the accumulated time warrants, which
+  // handles the edge case of a very large delta (e.g. tab hidden for a moment).
+  function gameLoop(timestamp) {
+    const delta = timestamp - (state.lastTime || timestamp);
+    state.lastTime = timestamp;
+
+    // Clear canvas
+    ctx.fillStyle = '#0d0d1a';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    if (state.gameState === STATE.START) {
+      // ── Start screen ─────────────────────────────────────────────────────
+      drawStartScreen();
+
+    } else if (state.gameState === STATE.PLAYING) {
+      // ── Accumulate delta time and advance game steps ──────────────────
+      if (!state.paused) {
+        state.accumulator += delta;
+        const ms = currentStepMs();
+        while (state.accumulator >= ms) {
+          state.accumulator -= ms;
+          step();
+          if (state.gameState !== STATE.PLAYING) break; // game over mid-loop
+        }
+      }
+
+      // ── Render ────────────────────────────────────────────────────────
+      drawGrid();
+      drawFood();
+      drawSnake();
+      if (state.paused) drawPauseOverlay();
+
+    } else if (state.gameState === STATE.GAMEOVER) {
+      // ── Game over: show frozen board + overlay ────────────────────────
+      drawGrid();
+      drawFood();
+      drawSnake();
+      drawGameOverScreen();
+    }
+
+    requestAnimationFrame(gameLoop);
+  }
+
+  // Kick off the loop
+  requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
